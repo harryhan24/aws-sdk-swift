@@ -4,9 +4,10 @@
 //  Created by Adam Fowler, Jonathan McAllister on 2019/10/20.
 //
 //
-import Foundation
 import AWSSDKSwiftCore
+import Foundation
 import NIO
+import NIOFoundationCompat
 
 public extension S3ErrorType {
     enum multipart : Error {
@@ -20,6 +21,11 @@ public extension S3ErrorType {
 
 public extension S3 {
 
+    enum ThreadPoolProvider {
+        case createNew(numberOfThreads: Int)
+        case shared(NIOThreadPool)
+    }
+    
     /// Multipart download of a file from S3.
     ///
     /// - parameters:
@@ -28,7 +34,12 @@ public extension S3 {
     ///     - on: an EventLoop to process each downloaded part on
     ///     - outputStream: Function to be called for each downloaded part. Called with data block and file size
     /// - returns: An EventLoopFuture that will receive the complete file size once the multipart download has finished.
-    func multipartDownload(_ input: GetObjectRequest, partSize: Int = 5*1024*1024, on eventLoop: EventLoop, outputStream: @escaping (Data, Int64) throws -> ()) -> EventLoopFuture<Int64> {
+    func multipartDownload(
+        _ input: GetObjectRequest,
+        partSize: Int = 5*1024*1024,
+        on eventLoop: EventLoop,
+        outputStream: @escaping (Data, Int64, EventLoop) -> EventLoopFuture<Void>
+    ) -> EventLoopFuture<Int64> {
         // function downloading part of a file
         func multipartDownloadPart(fileSize: Int64, offset: Int64, prevPartSave: EventLoopFuture<Int64>) -> EventLoopFuture<Int64> {
             guard fileSize > offset else {
@@ -46,8 +57,8 @@ public extension S3 {
                 versionId: input.versionId
             )
             return getObject(getRequest)
-                .and(prevPartSave)
                 .hop(to: eventLoop)
+                .and(prevPartSave)
                 .flatMap { (output, _) -> EventLoopFuture<Int64> in
                     do {
                         // should never happen
@@ -59,10 +70,7 @@ public extension S3 {
                         }
 
                         // output the data downloaded
-                        let part = eventLoop.submit { () -> Int64 in
-                            try outputStream(body, fileSize)
-                            return fileSize
-                        }
+                        let part = outputStream(body, fileSize, eventLoop).map { return fileSize }
 
                         let newOffset = offset + Int64(partSize)
                         return multipartDownloadPart(fileSize: fileSize, offset: newOffset, prevPartSave: part)
@@ -113,26 +121,43 @@ public extension S3 {
     ///     - on: EventLoop to process downloaded parts, if nil an eventLoop is taken from the clients eventLoopGroup
     ///     - progress: Callback that returns the progress of the download. It is called after each part is downloaded with a value between 0.0 and 1.0 indicating how far the download is complete (1.0 meaning finished).
     /// - returns: An EventLoopFuture that will receive the complete file size once the multipart download has finished.
-    func multipartDownload(_ input: GetObjectRequest, partSize: Int = 5*1024*1024, filename: String, on eventLoop: EventLoop? = nil, progress: @escaping (Double) throws -> () = { _ in }) -> EventLoopFuture<Int64> {
+    func multipartDownload(
+        _ input: GetObjectRequest,
+        partSize: Int = 5*1024*1024,
+        filename: String,
+        on eventLoop: EventLoop? = nil,
+        threadPoolProvider: ThreadPoolProvider = .createNew(numberOfThreads: 2),
+        progress: @escaping (Double) throws -> () = { _ in }
+    ) -> EventLoopFuture<Int64> {
         let eventLoop = eventLoop ?? self.client.eventLoopGroup.next()
-        return eventLoop.submit {  () -> Foundation.FileHandle in
-            FileManager.default.createFile(atPath: filename, contents: nil)
-            return try FileHandle(forWritingTo: URL(fileURLWithPath: filename))
-        }.flatMap { (fileHandle) -> EventLoopFuture<Int64> in
+        
+        let byteBufferAllocator = ByteBufferAllocator()
+        let threadPool: NIOThreadPool
+        switch threadPoolProvider {
+        case .createNew(let numberOfThreads):
+            threadPool = NIOThreadPool(numberOfThreads: numberOfThreads)
+            threadPool.start()
+        case .shared(let sharedPool):
+            threadPool = sharedPool
+        }
+        let fileIO = NonBlockingFileIO(threadPool: threadPool)
+
+        return fileIO.openFile(path: filename, mode: .write, flags: .allowFileCreation(), eventLoop: eventLoop).flatMap { (fileHandle) -> EventLoopFuture<Int64> in
             var progressValue : Int64 = 0
-            let outputStream: (Data, Int64) throws -> () = {  data, fileSize in
-                fileHandle.write(data)
-                progressValue += Int64(data.count)
-                try progress(Double(progressValue) / Double(fileSize))
+
+            let download = self.multipartDownload(input, partSize: partSize, on: eventLoop) { data, fileSize, eventLoop in
+                var byteBuffer = byteBufferAllocator.buffer(capacity: data.count)
+                byteBuffer.setBytes(data, at:0)
+                return fileIO.write(fileHandle: fileHandle, buffer: byteBuffer, eventLoop: eventLoop).flatMapThrowing { _ in
+                    progressValue += Int64(data.count)
+                    try progress(Double(progressValue) / Double(fileSize))
+                }
             }
-            let download = self.multipartDownload(
-                input,
-                partSize: partSize,
-                on: eventLoop,
-                outputStream: outputStream
-            )
             download.whenComplete { _ in
-                fileHandle.closeFile()
+                try? fileHandle.close()
+                if case .createNew(_) = threadPoolProvider {
+                    try? threadPool.syncShutdownGracefully()
+                }
             }
             return download
         }
@@ -145,7 +170,11 @@ public extension S3 {
     ///     - on: an EventLoop to process each part to upload
     ///     - inputStream: The function supplying the data parts to the multipartUpload. Each parts must be at least 5MB in size expect the last one which has no size limit.
     /// - returns: An EventLoopFuture that will receive a CompleteMultipartUploadOutput once the multipart upload has finished.
-    func multipartUpload(_ input: CreateMultipartUploadRequest, on eventLoop: EventLoop, inputStream: @escaping () throws -> Data?) -> EventLoopFuture<CompleteMultipartUploadOutput> {
+    func multipartUpload(
+        _ input: CreateMultipartUploadRequest,
+        on eventLoop: EventLoop,
+        inputStream: @escaping (EventLoop) -> EventLoopFuture<Data?>
+    ) -> EventLoopFuture<CompleteMultipartUploadOutput> {
         var completedParts: [S3.CompletedPart] = []
 
         // function uploading part of a file and queueing up upload of the next part
@@ -176,9 +205,7 @@ public extension S3 {
             }
 
             // load data EventLoopFuture
-            let result = eventLoop.submit {
-                return try inputStream()
-                }
+            let result = inputStream(eventLoop)
                 .and(uploadResult)
                 // upload data
                 .flatMap { (data, parts) -> EventLoopFuture<[S3.CompletedPart]> in
@@ -222,30 +249,52 @@ public extension S3 {
     ///     - on: EventLoop to process parts for upload, if nil an eventLoop is taken from the clients eventLoopGroup
     ///     - progress: Callback that returns the progress of the upload. It is called after each part is uploaded with a value between 0.0 and 1.0 indicating how far the upload is complete (1.0 meaning finished).
     /// - returns: An EventLoopFuture that will receive a CompleteMultipartUploadOutput once the multipart upload has finished.
-    func multipartUpload(_ input: CreateMultipartUploadRequest, partSize: Int = 5*1024*1024, filename: String, on eventLoop: EventLoop? = nil, progress: @escaping (Double) throws->() = { _ in }) -> EventLoopFuture<CompleteMultipartUploadOutput> {
+    func multipartUpload(
+        _ input: CreateMultipartUploadRequest,
+        partSize: Int = 5*1024*1024,
+        filename: String,
+        on eventLoop: EventLoop? = nil,
+        threadPoolProvider: ThreadPoolProvider = .createNew(numberOfThreads: 2),
+        progress: @escaping (Double) throws->() = { _ in }
+    ) -> EventLoopFuture<CompleteMultipartUploadOutput> {
         let eventLoop = eventLoop ?? self.client.eventLoopGroup.next()
-        var fileSize : UInt64 = 0
-        return eventLoop.submit {  () -> FileHandle in
-            fileSize = try FileManager.default.attributesOfItem(atPath: filename)[.size] as? UInt64 ?? UInt64.max
-            return try FileHandle(forReadingFrom: URL(fileURLWithPath: filename))
-        }.flatMap { (fileHandle) -> EventLoopFuture<CompleteMultipartUploadOutput> in
+        
+        let byteBufferAllocator = ByteBufferAllocator()
+        let threadPool: NIOThreadPool
+        switch threadPoolProvider {
+        case .createNew(let numberOfThreads):
+            threadPool = NIOThreadPool(numberOfThreads: numberOfThreads)
+            threadPool.start()
+        case .shared(let sharedPool):
+            threadPool = sharedPool
+        }
+        let fileIO = NonBlockingFileIO(threadPool: threadPool)
+
+        return fileIO.openFile(path: filename, eventLoop: eventLoop).flatMap { (fileHandle, fileRegion) -> EventLoopFuture<CompleteMultipartUploadOutput> in
             var progressAmount : Int64 = 0
+            
+            let fileSize = fileRegion.readableBytes
 
-            let inputStream: () throws -> Data? = {
-                try progress(Double(progressAmount) / Double(fileSize))
-                let data = fileHandle.readData(ofLength: partSize)
-                progressAmount += Int64(data.count)
-                return data
+            let upload = self.multipartUpload(input, on: eventLoop) { eventLoop in
+                
+                eventLoop.submit {
+                    try progress(Double(progressAmount) / Double(fileSize))
+                }.flatMap { _ in
+                    return fileIO.read(fileHandle: fileHandle, byteCount: partSize, allocator: byteBufferAllocator, eventLoop: eventLoop)
+                }.map { (byteBuffer: ByteBuffer)->Data? in
+                    progressAmount += Int64(byteBuffer.readableBytes)
+                    if byteBuffer.readableBytes == 0 {
+                        return nil
+                    }
+                    return byteBuffer.getData(at: byteBuffer.readerIndex, length: byteBuffer.readableBytes, byteTransferStrategy: .noCopy)
+                }
             }
-
-            let upload = self.multipartUpload(
-                input,
-                on: eventLoop,
-                inputStream: inputStream
-            )
-
+            
             upload.whenComplete { _ in
-                fileHandle.closeFile()
+                try? fileHandle.close()
+                if case .createNew(_) = threadPoolProvider {
+                    try? threadPool.syncShutdownGracefully()
+                }
             }
             return upload
         }
